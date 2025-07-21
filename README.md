@@ -1,2 +1,2 @@
 # Air-Quality-Forecasting-with-Random-Forest-and-KNN-Regression
-A machine learning pipeline for AQI prediction using Random Forest for feature selection and KNN Regression on pollutant data collected by sensors in an Italian city (2004-2005), sourced from the UCI Machine Learning Repository.
+A machine learning pipeline for AQI prediction using KNN regression. Multiple models were built using different feature combinations, and Random Forest feature importance was used post hoc to interpret why certain models outperformed others. Based on pollutant sensor data from an Italian city (2004–2005), sourced from the UCI Machine Learning Repository.
