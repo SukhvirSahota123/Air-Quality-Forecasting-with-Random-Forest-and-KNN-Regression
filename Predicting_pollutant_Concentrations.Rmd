@@ -1,0 +1,300 @@
+---
+title: "Air Quality Index (AQI) Prediction using KNN rand Random Forest"
+author: "Sukhvir"
+date: "2025-03-5"
+output: html_document
+---
+
+```{r load_required_libraries, message=FALSE, warning=FALSE}
+library(caret)
+library(randomForest)
+library(FNN)
+library(lubridate)
+library(ggplot2)
+library(Metrics)
+library(car)
+library(dplyr)
+library(tidyr)
+```
+
+```{r import_dataset}
+data <- read.csv("AirQualityUCI.csv", sep = ";")
+```
+
+```{r cleaning}
+#Data cleaning and preprocessing 
+data$Time <- gsub("\\.", ":", data$Time)
+data$Date <- dmy(data$Date)
+data$Time <- hms(data$Time)
+
+data$Hour <- hour(data$Time)
+data$Month <- month(data$Date)
+
+data <- data[, !(names(data) %in%
+                   c("NMHC.GT.", "PT08.S2.NMHC.", "X", "X.1", "Date", "Time"))]
+
+colnames(data) <- make.names(colnames(data))
+
+#NMHC Only has roughly 180 entries the rest are all NAs so I removed the 
+#True concentration and sensor reading for NMHC, X, X.1, and Data and Time
+
+predictors <- c("CO.GT.", "C6H6.GT.", "NOx.GT.", "NO2.GT.",
+                "PT08.S1.CO.", "PT08.S3.NOx.", "PT08.S4.NO2.",
+                "PT08.S5.O3.", "T", "RH", "AH", "Hour", "Month")
+data[predictors] <- 
+  lapply(data[predictors], function(x) as.numeric(gsub(",", ".", x)))
+#In this set -200 denotes missing values 
+data[data == -200] <- NA
+data <- na.omit(data)
+data <- data[data$CO.GT. != -200.0, ]
+```
+
+```{r AQI}
+#AQI calculation function
+calc_subindex <- function(C, breakpoints) {
+  for (i in 1:(nrow(breakpoints))) {
+    if (C >= breakpoints[i, "C_lo"] && C <= breakpoints[i, "C_hi"]) {
+      I_hi <- breakpoints[i, "I_hi"]
+      I_lo <- breakpoints[i, "I_lo"]
+      C_hi <- breakpoints[i, "C_hi"]
+      C_lo <- breakpoints[i, "C_lo"]
+      return(((I_hi - I_lo)/(C_hi - C_lo)) * (C - C_lo) + I_lo)
+    }
+  }
+  return(NA)
+}
+
+#CO Breakpoints (mg/m^3)
+co_breaks <- data.frame(
+  C_lo = c(0.0, 5.1, 10.8, 14.2, 17.5, 21.9),
+  C_hi = c(5.0, 10.7, 14.1, 17.4, 21.8, 30.4),
+  I_lo = c(0, 51, 101, 151, 201, 301),
+  I_hi = c(50, 100, 150, 200, 300, 400)
+)
+
+#NO2 Breakpoints (µg/m^3)
+no2_breaks <- data.frame(
+  C_lo = c(0, 101, 189, 239, 278, 337),
+  C_hi = c(100, 188, 238, 277, 336, 424),
+  I_lo = c(0, 51, 101, 151, 201, 301),
+  I_hi = c(50, 100, 150, 200, 300, 400)
+  
+)
+  
+#AQI Sub indices
+data$AQI_CO <- sapply(data$CO.GT.,
+                      function(x) calc_subindex(x, co_breaks))
+data$AQI_NO2 <- sapply(data$NO2.GT., 
+                       function(x) calc_subindex(x, no2_breaks))
+
+#Total AQI column 
+data$AQI <- pmax(data$AQI_CO, data$AQI_NO2, na.rm = TRUE)
+
+```
+
+
+```{r pollutant_vs_AQI}
+#Explanatory visualization: Pollutant vs AQI
+pollutant_data <- data %>%
+  select(AQI, CO.GT., NO2.GT., NOx.GT.) %>%
+  pivot_longer(cols = c(CO.GT., NO2.GT., NOx.GT.),
+               names_to = "Pollutant",
+               values_to = "Concentration")
+
+pollutant_data$Pollutant <- factor(pollutant_data$Pollutant,
+                                   levels = c("CO.GT.", "NO2.GT.", "NOx.GT."),
+                                   labels = c("Carbon Monoxide (mg/m³)", 
+                                              "Nitrogen Dioxide (µg/m³)", 
+                                              "Nitrogen Oxides (µg/m³)"))
+
+#Plot showing relationship between each pollutant and AQI values (Figure 2)
+ggplot(pollutant_data, aes(x = Concentration, y = AQI)) +
+  geom_point(color = "blue", alpha = 0.4) +
+  geom_smooth(method = "loess", se = FALSE, color = "red") +
+  facet_wrap(~ Pollutant, scales = "free_x") +  
+  labs(title = "Relationship between Pollutants and AQI",
+       x = "Concentration", y = "AQI")
+
+```
+
+```{r train_test_split}
+#Train/test split
+set.seed(123)  
+global_index <- createDataPartition(data$AQI, p = 0.7, list = FALSE)
+
+global_train <- data[global_index, ]
+global_test  <- data[-global_index, ]
+
+```
+
+```{r KNN_Helper}
+#KNN Helper Function
+
+find_k <- function(x_train_scaled, x_test_scaled, y_test, y_train) {
+  k_vals <- 1:30
+  mse_vals <- numeric(length(k_vals))
+  
+  for (i in seq_along(k_vals)) {
+    model <- knn.reg(train = x_train_scaled, test = x_test_scaled, 
+                     y = y_train, k = k_vals[i])
+    
+    predictions <- model$pred
+    mse_vals[i] <- mean((y_test - predictions)^2)
+  }
+  
+  k <- k_vals[which.min(mse_vals)]
+  
+  return(k)
+}
+
+run_model <- function(x_train_scaled, x_test_scaled, y_train, k, y_test) {
+  target_knn <- knn.reg(train = x_train_scaled, test = x_test_scaled, 
+                        y = y_train, k = k)
+  
+  final_preds <- target_knn$pred
+  
+  mse <- mean((y_test - final_preds)^2)
+  rmse <- sqrt(mse)
+  mae <- mean(abs(y_test - final_preds))
+  r2 <- 1 - sum((y_test - final_preds)^2) / sum((y_test - mean(y_test))^2)
+  
+  return(list(
+    mse = mse,
+    rmse = rmse,
+    mae = mae,
+    R2 = r2,
+    final_preds = final_preds
+  ))
+}
+
+```
+
+```{r model1}
+#Model 1: AQI vs atmospheric variables 
+target_1 <- "AQI"
+predictors_1 <- c("CO.GT.", "NO2.GT.", "NOx.GT.", "T", "RH", "AH")
+train_data <- global_train
+test_data  <- global_test
+
+scaler <- preProcess(train_data[, predictors_1], method = c("center", "scale"))
+x_train_scaled <- predict(scaler, train_data[, predictors_1])
+x_test_scaled  <- predict(scaler, test_data[, predictors_1])
+
+y_train <- train_data$AQI
+y_test  <- test_data$AQI
+
+k_best <- find_k(x_train_scaled, x_test_scaled, y_test, y_train)
+cat("Best k:", k_best, "\n")
+
+results <- run_model(x_train_scaled, x_test_scaled, y_train, k_best, y_test)
+#results
+
+ggplot(data.frame(Actual = y_test, Predicted = results$final_preds),
+       aes(x = Actual, y = Predicted)) +
+  geom_point(alpha = 0.5, color = "blue") +
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+  labs(title = "Predicted vs Actual AQI",
+       subtitle = "KNN using Pollutant Concentrations, and Atmospheric Variables (k = 5)",
+       x = "Actual AQI", y = "Predicted AQI")
+
+```
+
+```{r model2}
+#Model 2: Predicting AQI based on total pollution, and time 
+
+predictors_2 <- c("CO.GT.", "NO2.GT.", "NOx.GT.", "Month", "Hour")
+
+train_data_2 <- global_train
+test_data_2  <- global_test
+
+scaler_2 <- preProcess(train_data_2[, predictors_2], method = c("center", "scale"))
+x_train_scaled_2 <- predict(scaler_2, train_data_2[, predictors_2])
+x_test_scaled_2  <- predict(scaler_2, test_data_2[, predictors_2])
+
+y_train_2 <- train_data_2$AQI
+y_test_2  <- test_data_2$AQI
+
+k_best2 <- find_k(x_train_scaled_2, x_test_scaled_2, y_test_2, y_train_2)
+cat("Best k:", k_best2, "\n")
+
+results_2 <- run_model(x_train_scaled_2, x_test_scaled_2, y_train_2, k_best2, y_test_2)
+#results_2
+
+
+ggplot(data.frame(Actual = y_test_2, Predicted = results_2$final_preds),
+       aes(x = Actual, y = Predicted)) +
+  geom_point(alpha = 0.5, color = "pink") +
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+  labs(title = "Predicted vs Actual AQI",
+       subtitle = "KNN using Pollutant Concentrations, Month, and Hour (k = 3)",
+       x = "Actual AQI", y = "Predicted AQI") 
+
+```
+
+```{r model 3} 
+#Third Model: Pollutants, time and atmospheric
+predictors_3 <- c("Month", "Hour", "CO.GT.", "NO2.GT.", "NOx.GT.", 
+                  "T", "AH", "RH")
+
+train_data_3 <-  global_train
+test_data_3  <- global_test
+
+scaler_3 <- preProcess(train_data_3[, predictors_3], method = c("center", "scale"))
+x_train_scaled_3 <- predict(scaler_3, train_data_3[, predictors_3])
+x_test_scaled_3  <- predict(scaler_3, test_data_3[, predictors_3])
+
+y_train_3 <- train_data_3$AQI
+y_test_3  <- test_data_3$AQI
+
+k_best3 <- find_k(x_train_scaled_3, x_test_scaled_3, y_test_3, y_train_3)
+cat("Best k:", k_best3, "\n")
+
+results_3 <- run_model(x_train_scaled_3, x_test_scaled_3, y_train_3, k_best3, y_test_3)
+#results_3
+
+
+ggplot(data.frame(Actual = y_test_3, Predicted = results_3$final_preds),
+       aes(x = Actual, y = Predicted)) +
+  geom_point(alpha = 0.5, color = "darkorange") +
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+  labs(title = "Predicted vs Actual AQI",
+       subtitle = "KNN Regression Model using Time, Pollutants, and Atmospheric Variables (k = 3)",
+       x = "Actual AQI", y = "Predicted AQI")
+
+```
+
+```{r RF}
+#Random forest feature importance
+pollutant_forest <- function(target_name, original_train) {
+  target <- as.formula(paste(target_name, "~."))
+  forest <- randomForest(target, data = original_train , importance = TRUE)
+  
+  importance <- importance(forest)
+  importance_ranked <- importance[order(importance[, 1], decreasing = TRUE), ]
+  
+  return (list(forest_model = forest, importance = importance_ranked))
+}
+
+rf_train_3 <- train_data_3[, c("AQI", predictors_3)]
+
+#Figure 8
+Poll_forest_3 <- pollutant_forest("AQI", rf_train_3)
+Poll_forest_3$importance
+varImpPlot(Poll_forest_3$forest_model,
+           main = "Feature Importance for AQI Prediction",
+           col = "darkblue", pch = 19)
+
+```
+
+```{r Accuracy}
+#Model accuracy summary
+result_table <- data.frame(
+  Model = c("Model 1", "Model 2", "Model 3"),
+  MSE = c(results$mse, results_2$mse, results_3$mse),
+  RMSE = c(results$rmse, results_2$rmse, results_3$rmse),
+  MAE = c(results$mae, results_2$mae, results_3$mae),
+  R2 = c(results$R2, results_2$R2, results_3$R2 )
+)
+result_table
+```
+
